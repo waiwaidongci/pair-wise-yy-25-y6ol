@@ -16,6 +16,8 @@ class DomainError(ValueError):
 class CorpusDB:
     """A small multi-annotator corpus governance service."""
 
+    MAX_PENDING = 2  # 每人手里未提交的任务最多保留两份
+
     def __init__(self, path: str = "corpus.db") -> None:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
@@ -63,7 +65,16 @@ class CorpusDB:
               batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
               ordinal INTEGER NOT NULL,
               text TEXT NOT NULL,
+              required_annotators INTEGER NOT NULL DEFAULT 2 CHECK(required_annotators >= 1),
               UNIQUE(batch_id, ordinal)
+            );
+            CREATE TABLE IF NOT EXISTS claim_queue (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+              item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+              annotator_id INTEGER NOT NULL REFERENCES users(id),
+              created_at TEXT NOT NULL,
+              UNIQUE(item_id, annotator_id)
             );
             CREATE TABLE IF NOT EXISTS assignments (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,6 +129,9 @@ class CorpusDB:
             );
             """
         )
+        columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(items)")}
+        if "required_annotators" not in columns:
+            self.conn.execute("ALTER TABLE items ADD COLUMN required_annotators INTEGER NOT NULL DEFAULT 2")
         self.conn.commit()
 
     def seed_demo(self) -> None:
@@ -166,34 +180,144 @@ class CorpusDB:
             )
         return int(cur.lastrowid)
 
-    def add_item(self, batch_id: int, ordinal: int, text: str) -> int:
+    def add_item(self, batch_id: int, ordinal: int, text: str, required_annotators: int = 2) -> int:
         batch = self.conn.execute("SELECT status FROM batches WHERE id=?", (batch_id,)).fetchone()
         if not batch or batch["status"] == "frozen":
             raise DomainError("批次不存在或已经冻结")
         if ordinal <= 0 or not text.strip():
             raise DomainError("序号必须大于0且文本不能为空")
+        if int(required_annotators) < 1:
+            raise DomainError("每条至少需要一位标注员")
         with self.transaction():
             try:
-                cur = self.conn.execute("INSERT INTO items(batch_id,ordinal,text) VALUES(?,?,?)", (batch_id, ordinal, text.strip()))
+                cur = self.conn.execute(
+                    "INSERT INTO items(batch_id,ordinal,text,required_annotators) VALUES(?,?,?,?)",
+                    (batch_id, ordinal, text.strip(), int(required_annotators)),
+                )
             except sqlite3.IntegrityError as exc:
                 raise DomainError("该批次序号已存在") from exc
         return int(cur.lastrowid)
 
-    def assign(self, item_id: int, annotator_id: int) -> int:
-        item = self.conn.execute("SELECT batch_id FROM items WHERE id=?", (item_id,)).fetchone()
+    def _pending_count(self, annotator_id: int) -> int:
+        """已领取但尚未提交的任务数（占手名额）。"""
+        return int(self.conn.execute(
+            "SELECT COUNT(*) FROM assignments WHERE annotator_id=? AND status='assigned'", (annotator_id,)
+        ).fetchone()[0])
+
+    def _promote_claims(self) -> list[dict]:
+        """按 FIFO 扫描等待队列，名额和个人手速上限同时满足时补入名额。
+
+        一次扫描只跳过放不下的人，不挡后面的人；返回本次新进入名额的列表。
+        调用方需已持有 BEGIN IMMEDIATE 事务。
+        """
+        promoted = []
+        for row in self.conn.execute(
+            "SELECT q.id,q.batch_id,q.item_id,q.annotator_id "
+            "FROM claim_queue q ORDER BY q.id"
+        ).fetchall():
+            if self._pending_count(row["annotator_id"]) >= self.MAX_PENDING:
+                continue
+            taken = self.conn.execute(
+                "SELECT COUNT(*) FROM assignments WHERE item_id=?", (row["item_id"],)
+            ).fetchone()[0]
+            required = self.conn.execute(
+                "SELECT required_annotators FROM items WHERE id=?", (row["item_id"],)
+            ).fetchone()[0]
+            if taken >= required:
+                continue
+            self.conn.execute(
+                "INSERT INTO assignments(batch_id,item_id,annotator_id,status) VALUES(?,?,?,'assigned')",
+                (row["batch_id"], row["item_id"], row["annotator_id"]),
+            )
+            self.conn.execute("UPDATE batches SET status='annotating' WHERE id=? AND status='draft'", (row["batch_id"],))
+            self.conn.execute("DELETE FROM claim_queue WHERE id=?", (row["id"],))
+            promoted.append({"item_id": row["item_id"], "annotator_id": row["annotator_id"]})
+        return promoted
+
+    def assign(self, item_id: int, annotator_id: int) -> dict:
+        """领取条目：有名额且未到手速上限就立即占入，否则停进 FIFO 队列。
+
+        重复领取幂等：已占名额或已在队列中时原样返回，不重新排队也不报错。
+        """
+        item = self.conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
         user = self.conn.execute("SELECT role FROM users WHERE id=?", (annotator_id,)).fetchone()
         if not item or not user or user["role"] != "annotator":
             raise DomainError("条目不存在或用户不是标注员")
+        batch = self.conn.execute("SELECT status FROM batches WHERE id=?", (item["batch_id"],)).fetchone()
+        if batch["status"] == "frozen":
+            raise DomainError("批次已冻结，不能领取")
+        existing = self.conn.execute(
+            "SELECT status FROM assignments WHERE item_id=? AND annotator_id=?", (item_id, annotator_id)
+        ).fetchone()
+        if existing:
+            return {
+                "assignment_id": int(self.conn.execute(
+                    "SELECT id FROM assignments WHERE item_id=? AND annotator_id=?", (item_id, annotator_id)
+                ).fetchone()["id"]),
+                "state": existing["status"], "queued": False, "item_id": item_id,
+                "annotator_id": annotator_id, "promoted": [],
+            }
+        queued = self.conn.execute(
+            "SELECT id FROM claim_queue WHERE item_id=? AND annotator_id=?", (item_id, annotator_id)
+        ).fetchone()
+        if queued:
+            return {
+                "assignment_id": None, "state": "queued", "queued": True, "item_id": item_id,
+                "annotator_id": annotator_id, "promoted": [],
+            }
         with self.transaction():
-            self.conn.execute("UPDATE batches SET status='annotating' WHERE id=? AND status='draft'", (item["batch_id"],))
-            try:
+            pending = self._pending_count(annotator_id)
+            taken = self.conn.execute(
+                "SELECT COUNT(*) FROM assignments WHERE item_id=?", (item_id,)
+            ).fetchone()[0]
+            if pending < self.MAX_PENDING and taken < item["required_annotators"]:
+                self.conn.execute("UPDATE batches SET status='annotating' WHERE id=? AND status='draft'", (item["batch_id"],))
                 cur = self.conn.execute(
-                    "INSERT INTO assignments(batch_id,item_id,annotator_id) VALUES(?,?,?)",
+                    "INSERT INTO assignments(batch_id,item_id,annotator_id,status) VALUES(?,?,?,'assigned')",
                     (item["batch_id"], item_id, annotator_id),
                 )
-            except sqlite3.IntegrityError as exc:
-                raise DomainError("同一标注员不能重复领取同一条目") from exc
-        return int(cur.lastrowid)
+                return {
+                    "assignment_id": int(cur.lastrowid), "state": "assigned", "queued": False,
+                    "item_id": item_id, "annotator_id": annotator_id, "promoted": [],
+                }
+            self.conn.execute(
+                "INSERT INTO claim_queue(batch_id,item_id,annotator_id,created_at) VALUES(?,?,?,?)",
+                (item["batch_id"], item_id, annotator_id, datetime.now().isoformat()),
+            )
+            position = int(self.conn.execute(
+                "SELECT COUNT(*) FROM claim_queue WHERE item_id=? AND id<=(SELECT id FROM claim_queue WHERE item_id=? AND annotator_id=?)",
+                (item_id, item_id, annotator_id),
+            ).fetchone()[0])
+            return {
+                "assignment_id": None, "state": "queued", "queued": True, "item_id": item_id,
+                "annotator_id": annotator_id, "queue_position": position, "promoted": [],
+            }
+
+    def release(self, item_id: int, annotator_id: int) -> dict:
+        """交回任务：未提交的占位立即删除并放出名额，队列按 FIFO 补人。
+
+        已提交的任务不能交回；仅在队列等待则取消排队。
+        """
+        assignment = self.conn.execute(
+            "SELECT id,status,batch_id FROM assignments WHERE item_id=? AND annotator_id=?", (item_id, annotator_id)
+        ).fetchone()
+        waiting = self.conn.execute(
+            "SELECT id FROM claim_queue WHERE item_id=? AND annotator_id=?", (item_id, annotator_id)
+        ).fetchone()
+        if not assignment and not waiting:
+            raise DomainError("没有领取或排队中的该条目任务")
+        if assignment and assignment["status"] == "submitted":
+            raise DomainError("已提交的任务不能交回")
+        with self.transaction():
+            if assignment:
+                self.conn.execute("DELETE FROM assignments WHERE id=?", (assignment["id"],))
+            if waiting:
+                self.conn.execute("DELETE FROM claim_queue WHERE id=?", (waiting["id"],))
+            promoted = self._promote_claims()
+        return {
+            "ok": True, "item_id": item_id, "annotator_id": annotator_id,
+            "released": bool(assignment), "canceled_queue": bool(waiting), "promoted": promoted,
+        }
 
     def submit_annotation(self, item_id: int, annotator_id: int, label: str, comment: str = "") -> int:
         if not label.strip():
@@ -227,7 +351,9 @@ class CorpusDB:
             else:
                 annotation_id = int(cur.lastrowid)
             self.conn.execute("UPDATE assignments SET status='submitted' WHERE id=?", (assignment["id"],))
-        return int(annotation_id)
+            promoted = self._promote_claims()
+        result = {"annotation_id": int(annotation_id), "promoted": promoted}
+        return result
 
     def add_discussion(self, item_id: int, author_id: int, body: str, contains_answer: bool = False) -> int:
         if not body.strip():
@@ -267,6 +393,37 @@ class CorpusDB:
         payload["own_annotation"] = dict(own) if own else None
         payload["discussions"] = discussions
         return payload
+
+    def item_coverage(self, batch_id: int) -> list[dict]:
+        """逐条统计覆盖进度：已提交、占着未提交、队列人数，以及还差几人。"""
+        batch = self.conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+        if not batch:
+            raise DomainError("批次不存在")
+        result = []
+        for item in self.conn.execute(
+            "SELECT * FROM items WHERE batch_id=? ORDER BY ordinal", (batch_id,)
+        ).fetchall():
+            rows = self.conn.execute(
+                "SELECT a.status,u.name FROM assignments a JOIN users u ON u.id=a.annotator_id WHERE a.item_id=?",
+                (item["id"],),
+            ).fetchall()
+            submitted = [r["name"] for r in rows if r["status"] == "submitted"]
+            holding = [r["name"] for r in rows if r["status"] == "assigned"]
+            queued = [r["name"] for r in self.conn.execute(
+                "SELECT u.name FROM claim_queue q JOIN users u ON u.id=q.annotator_id WHERE q.item_id=? ORDER BY q.id",
+                (item["id"],),
+            ).fetchall()]
+            submitted_count = len(submitted)
+            result.append({
+                "item_id": item["id"], "ordinal": item["ordinal"], "text": item["text"],
+                "required": item["required_annotators"],
+                "submitted": submitted_count,
+                "holding": holding,
+                "queued": queued,
+                "open_slots": max(0, item["required_annotators"] - len(rows)),
+                "missing": max(0, item["required_annotators"] - submitted_count),
+            })
+        return result
 
     def disagreements(self, batch_id: int) -> list[dict]:
         batch = self.conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
@@ -370,18 +527,26 @@ class CorpusDB:
         disagreements = self.disagreements(batch_id)
         if disagreements:
             raise DomainError(f"仍有 {len(disagreements)} 条分歧未仲裁")
-        missing = []
-        for item in items:
-            count = self.conn.execute(
-                "SELECT COUNT(*) FROM annotations WHERE item_id=? AND guideline_id=?", (item["id"], batch["guideline_id"])
-            ).fetchone()[0]
-            if count < 2:
-                missing.append(item["id"])
-        if missing:
-            raise DomainError(f"条目缺少至少两份标注: {missing}")
+        coverage = self.item_coverage(batch_id)
+        underfilled = [c for c in coverage if c["missing"]]
+        if underfilled:
+            details = []
+            for c in underfilled:
+                parts = [
+                    f"条目{c['ordinal']}需{c['required']}人、仅{c['submitted']}人提交、差{c['missing']}人",
+                ]
+                if c["holding"]:
+                    parts.append("占住未提交:" + "、".join(c["holding"]))
+                else:
+                    parts.append("无人占名额")
+                if c["queued"]:
+                    parts.append(f"队列等待{len(c['queued'])}人:" + "、".join(c["queued"]))
+                details.append("；".join(parts))
+            raise DomainError("覆盖人数不足：" + "；".join(details))
         metrics = self.consistency(batch_id)
         frozen_at = datetime.now().isoformat()
         with self.transaction():
+            self.conn.execute("DELETE FROM claim_queue WHERE batch_id=?", (batch_id,))
             for item in items:
                 labels = [r["label"] for r in self.conn.execute(
                     "SELECT label FROM annotations WHERE item_id=? AND guideline_id=?", (item["id"], batch["guideline_id"])
@@ -417,9 +582,58 @@ class CorpusDB:
         }
 
     def snapshot(self) -> dict:
+        users = [dict(r) for r in self.conn.execute(
+            "SELECT id,name,role FROM users ORDER BY id"
+        ).fetchall()]
+        pending = {
+            r["annotator_id"]: r["n"]
+            for r in self.conn.execute(
+                "SELECT annotator_id,COUNT(*) n FROM assignments WHERE status='assigned' GROUP BY annotator_id"
+            )
+        }
+        queued = {
+            r["annotator_id"]: r["n"]
+            for r in self.conn.execute(
+                "SELECT annotator_id,COUNT(*) n FROM claim_queue GROUP BY annotator_id"
+            )
+        }
+        for user in users:
+            user["pending_count"] = pending.get(user["id"], 0)
+            user["queued_count"] = queued.get(user["id"], 0)
+        items = [dict(r) for r in self.conn.execute(
+            "SELECT * FROM items ORDER BY batch_id,ordinal"
+        ).fetchall()]
+        taken = {
+            r["item_id"]: r["n"]
+            for r in self.conn.execute("SELECT item_id,COUNT(*) n FROM assignments GROUP BY item_id")
+        }
+        submitted = {
+            r["item_id"]: r["n"]
+            for r in self.conn.execute(
+                "SELECT item_id,COUNT(*) n FROM assignments WHERE status='submitted' GROUP BY item_id"
+            )
+        }
+        waiting = {
+            r["item_id"]: r["n"]
+            for r in self.conn.execute("SELECT item_id,COUNT(*) n FROM claim_queue GROUP BY item_id")
+        }
+        for item in items:
+            item["taken"] = taken.get(item["id"], 0)
+            item["submitted"] = submitted.get(item["id"], 0)
+            item["queued"] = waiting.get(item["id"], 0)
+            item["open_slots"] = max(0, item["required_annotators"] - item["taken"])
+            item["missing"] = max(0, item["required_annotators"] - item["submitted"])
         return {
-            "users": [dict(r) for r in self.conn.execute("SELECT id,name,role FROM users ORDER BY id")],
+            "users": users,
             "guidelines": [dict(r) for r in self.conn.execute("SELECT * FROM guidelines ORDER BY id")],
             "batches": [dict(r) for r in self.conn.execute("SELECT * FROM batches ORDER BY id")],
-            "items": [dict(r) for r in self.conn.execute("SELECT * FROM items ORDER BY batch_id,ordinal")],
+            "items": items,
+            "assignments": [dict(r) for r in self.conn.execute(
+                "SELECT id,batch_id,item_id,annotator_id,status FROM assignments ORDER BY id"
+            )],
+            "claim_queue": [dict(r) for r in self.conn.execute(
+                "SELECT q.id,q.batch_id,q.item_id,q.annotator_id,u.name AS annotator_name,q.created_at "
+                "FROM claim_queue q JOIN users u ON u.id=q.annotator_id ORDER BY q.id"
+            )],
+            "max_pending_per_annotator": self.MAX_PENDING,
         }

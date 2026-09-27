@@ -1,8 +1,45 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>语料标注与仲裁</title>
-<style>body{font:15px system-ui;max-width:1080px;margin:24px auto;padding:0 16px;background:#f6f7f9}section{background:#fff;padding:16px;margin:12px 0;border:1px solid #ddd;border-radius:10px}input,textarea,select,button{padding:7px;margin:3px;border:1px solid #bbb;border-radius:6px}button{background:#235347;color:#fff}pre{white-space:pre-wrap;max-height:360px;overflow:auto}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.grid input,.grid textarea{width:90%}</style>
-<h1>语料标注与争议仲裁</h1><section><button onclick="load()">刷新状态</button><pre id="state"></pre></section>
-<section><h2>标注与讨论</h2><div class="grid"><input id="item" type="number" placeholder="条目 ID"><input id="user" type="number" placeholder="用户 ID"><input id="label" placeholder="标签"><textarea id="comment" placeholder="备注"></textarea><input id="batch" type="number" placeholder="批次 ID"><input id="manager" type="number" placeholder="管理员 ID"></div>
-<button onclick="annotate()">提交标注</button><button onclick="loadItem()">查看条目与讨论可见性</button><button onclick="disagreements()">查看分歧</button><button onclick="consistency()">一致性</button><button onclick="freeze()">冻结金标准</button><pre id="result"></pre></section>
+<style>body{font:15px system-ui;max-width:1080px;margin:24px auto;padding:0 16px;background:#f6f7f9}section{background:#fff;padding:16px;margin:12px 0;border:1px solid #ddd;border-radius:10px}input,textarea,select,button{padding:7px;margin:3px;border:1px solid #bbb;border-radius:6px}button{background:#235347;color:#fff}pre{white-space:pre-wrap;max-height:360px;overflow:auto}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.grid input,.grid textarea{width:90%}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:5px 8px;text-align:left}th{background:#eef2f0}.warn{color:#a40}.ok{color:#1a7}</style>
+<h1>语料标注与争议仲裁</h1>
+<section><button onclick="load()">刷新状态</button> <span id="rule"></span>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px"><div><h3>标注员待办</h3><table><thead><tr><th>ID</th><th>姓名</th><th>占住未提交</th><th>排队中</th></tr></thead><tbody id="users"></tbody></table></div>
+<div><h3>条目覆盖</h3><table><thead><tr><th>批次</th><th>#</th><th>需</th><th>已提交</th><th>占住</th><th>缺</th><th>排队</th></tr></thead><tbody id="items"></tbody></table></div></div>
+<h3>等待队列</h3><table><thead><tr><th>顺序</th><th>条目</th><th>标注员</th><th>时间</th></tr></thead><tbody id="queue"></tbody></table>
+<pre id="state"></pre></section>
+<section><h2>建批次 / 条目 / 领取 / 交回</h2><div class="grid">
+<input id="bname" placeholder="批次名称"><input id="guideline" type="number" placeholder="指南 ID"><input id="nbatch" placeholder="（建批次结果在此）" disabled>
+<input id="batch" type="number" placeholder="批次 ID"><input id="ordinal" type="number" placeholder="条目序号"><input id="required" type="number" value="2" placeholder="需要几位标注员">
+<textarea id="text" placeholder="条目文本"></textarea><input id="item" type="number" placeholder="条目 ID（领取/交回）"><input id="user" type="number" placeholder="标注员 ID">
+</div>
+<button onclick="createBatch()">建批次</button><button onclick="addItem()">建条目(登记人数)</button><button onclick="claim()">领取/排队</button><button onclick="returnTask()">交回</button><button onclick="coverage()">覆盖情况</button><pre id="result"></pre></section>
+<section><h2>标注与讨论</h2><div class="grid"><input id="label" placeholder="标签"><textarea id="comment" placeholder="备注"></textarea><input id="manager" type="number" placeholder="管理员 ID（冻结）"></div>
+<button onclick="annotate()">提交标注</button><button onclick="loadItem()">查看条目与讨论可见性</button><button onclick="disagreements()">查看分歧</button><button onclick="consistency()">一致性</button><button onclick="freeze()">冻结金标准</button></section>
 <section><h2>仲裁</h2><input id="arb" type="number" placeholder="仲裁员 ID"><input id="final" placeholder="最终标签"><input id="reason" placeholder="理由至少5字"><button onclick="adjudicate()">提交仲裁</button></section>
-<script>const result=document.querySelector('#result');const show=x=>result.textContent=JSON.stringify(x,null,2);async function get(u){return show(await(await fetch(u)).json())}async function post(u,b){return show(await(await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})).json())}async function load(){show(await(await fetch('/api/state')).json())}function annotate(){post('/api/annotations',{item_id:+item.value,annotator_id:+user.value,label:label.value,comment:comment.value})}function loadItem(){get('/api/items/'+item.value+'?user_id='+user.value)}function disagreements(){get('/api/batches/'+batch.value+'/disagreements')}function consistency(){get('/api/batches/'+batch.value+'/consistency')}function adjudicate(){post('/api/adjudications',{item_id:+item.value,arbitrator_id:+arb.value,final_label:final.value,reason:reason.value})}function freeze(){post('/api/batches/'+batch.value+'/freeze',{manager_id:+manager.value})}load()</script>
+<script>
+const result=document.querySelector('#result');
+const show=x=>result.textContent=JSON.stringify(x,null,2);
+async function get(u){return show(await(await fetch(u)).json())}
+async function post(u,b){return show(await(await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})).json())}
+function createBatch(){post('/api/batches',{name:bname.value,guideline_id:+guideline.value})}
+function addItem(){post('/api/batches/'+batch.value+'/items',{ordinal:+ordinal.value,text:text.value,required_annotators:+required.value})}
+function claim(){post('/api/claims',{item_id:+item.value,annotator_id:+user.value})}
+function returnTask(){post('/api/returns',{item_id:+item.value,annotator_id:+user.value})}
+function coverage(){get('/api/batches/'+batch.value+'/coverage')}
+function annotate(){post('/api/annotations',{item_id:+item.value,annotator_id:+user.value,label:label.value,comment:comment.value})}
+function loadItem(){get('/api/items/'+item.value+'?user_id='+user.value)}
+function disagreements(){get('/api/batches/'+batch.value+'/disagreements')}
+function consistency(){get('/api/batches/'+batch.value+'/consistency')}
+function adjudicate(){post('/api/adjudications',{item_id:+item.value,arbitrator_id:+arb.value,final_label:final.value,reason:reason.value})}
+function freeze(){post('/api/batches/'+batch.value+'/freeze',{manager_id:+manager.value})}
+const roleName={annotator:'标注员',arbitrator:'仲裁员',manager:'管理员'};
+async function load(){
+  const s=await(await fetch('/api/state')).json();
+  document.querySelector('#rule').textContent=`每人未提交任务最多保留 ${s.max_pending_per_annotator} 份，名额满或手速到顶即排队，交回立即按 FIFO 补位`;
+  document.querySelector('#users').innerHTML=s.users.filter(u=>u.role==='annotator').map(u=>`<tr><td>${u.id}</td><td>${u.name}</td><td class="${u.pending_count>=s.max_pending_per_annotator?'warn':'ok'}">${u.pending_count}/${s.max_pending_per_annotator}</td><td>${u.queued_count}</td></tr>`).join('');
+  document.querySelector('#items').innerHTML=s.items.map(i=>`<tr><td>${i.batch_id}</td><td>${i.ordinal}</td><td>${i.required_annotators}</td><td>${i.submitted}</td><td>${i.taken-i.submitted}</td><td class="${i.missing?'warn':'ok'}">${i.missing}</td><td>${i.queued}</td></tr>`).join('');
+  document.querySelector('#queue').innerHTML=s.claim_queue.map((q,n)=>`<tr><td>${n+1}</td><td>${q.item_id}</td><td>${q.annotator_name}</td><td>${q.created_at.replace('T',' ').slice(0,19)}</td></tr>`).join('');
+  show(s);
+}
+load();
+</script>
 </html>
