@@ -25,7 +25,8 @@ python -m unittest discover -s tests -v
 ## 接口
 
 - `POST /api/users`、`POST /api/guidelines`、`POST /api/batches`
-- `POST /api/batches/{id}/items`、`POST /api/batches/{id}/assign`
+- `POST /api/batches/{id}/items`（可带 `required_annotators` 登记所需标注人数，默认 2）、`POST /api/batches/{id}/assign`
+- `POST /api/items/{id}/return`（交回未提交的任务）
 - `POST /api/annotations`、`POST /api/adjudications`
 - `GET /api/items/{id}?user_id=`
 - `GET /api/batches/{id}/disagreements`
@@ -33,4 +34,6 @@ python -m unittest discover -s tests -v
 - `POST /api/batches/{id}/freeze`
 - `GET /api/batches/{id}/gold`
 
-一致性同时返回逐条成对一致率和 Fleiss Kappa。冻结要求每条至少有两人标注、没有未仲裁分歧；冻结后不能修改标注，导出结果来自不可变的 `gold_records`。
+领取、交回与冻结是联动的：建条目时登记所需标注人数；每位标注员手里未提交的任务最多 2 份，条目名额已满或个人待办达上限时领取请求进入等待队列（重复领取保持排队，不重复占位）；交回未提交任务会立即放出名额并按排队顺序补位，提交也会释放个人名额触发补位。`/api/state` 返回每位标注员的待办数、每个条目的已领/已交/还缺人数和等待队列。冻结按条目登记的人数核查覆盖，不足时报出具体缺口（如"条目#3（序号3）需2人，已交0人，还差2人"）。
+
+一致性同时返回逐条成对一致率和 Fleiss Kappa。冻结要求每条达到登记覆盖人数、没有未仲裁分歧；冻结后不能修改标注，导出结果来自不可变的 `gold_records`。

@@ -56,6 +56,57 @@ class CorpusFlowTest(unittest.TestCase):
         with self.assertRaisesRegex(DomainError, "标注员"):
             self.db.assign(self.item2, self.arb)
 
+    def test_claim_limits_queue_and_return_promotes(self):
+        a3 = self.db.add_user("丙", "annotator")
+        item3 = self.db.add_item(self.batch, 3, "第三条文本。")
+        # 甲领取两条后达到个人待办上限，再领只能排队
+        self.assertEqual("assigned", self.db.assign(self.item1, self.a1)["status"])
+        self.assertEqual("assigned", self.db.assign(self.item2, self.a1)["status"])
+        self.assertEqual("queued", self.db.assign(item3, self.a1)["status"])
+        # 乙领走条目1最后一个名额，丙只能排队；重复领取保持排队，不重复占位
+        self.assertEqual("assigned", self.db.assign(self.item1, self.a2)["status"])
+        self.assertEqual("queued", self.db.assign(self.item1, a3)["status"])
+        self.assertEqual("queued", self.db.assign(self.item1, a3)["status"])
+        snap = self.db.snapshot()
+        self.assertEqual(2, len(snap["queue"]))
+        self.assertEqual(2, next(u["pending"] for u in snap["users"] if u["id"] == self.a1))
+        self.assertEqual(0, next(i for i in snap["items"] if i["id"] == self.item1)["needed"])
+        self.assertEqual(1, next(i for i in snap["items"] if i["id"] == self.item2)["needed"])
+        # 提交释放个人名额，甲排队的条目3被补位；条目1名额仍满，丙继续排队
+        self.db.submit_annotation(self.item1, self.a1, "正向")
+        snap = self.db.snapshot()
+        self.assertEqual(2, next(u["pending"] for u in snap["users"] if u["id"] == self.a1))
+        self.assertEqual(1, next(i for i in snap["items"] if i["id"] == item3)["active_assignments"])
+        self.assertEqual(1, len(snap["queue"]))
+        # 乙交回未提交任务，名额立即给排队的丙
+        result = self.db.return_task(self.item1, self.a2)
+        self.assertEqual([{"item_id": self.item1, "annotator_id": a3}], result["promoted"])
+        snap = self.db.snapshot()
+        self.assertEqual(0, next(i for i in snap["items"] if i["id"] == self.item1)["needed"])
+        self.assertEqual(0, len(snap["queue"]))
+        # 已提交的任务不能交回
+        with self.assertRaisesRegex(DomainError, "已提交"):
+            self.db.return_task(self.item1, self.a1)
+
+    def test_freeze_explains_coverage_shortfall(self):
+        a3 = self.db.add_user("丙", "annotator")
+        item3 = self.db.add_item(self.batch, 3, "需要三人覆盖。", required_annotators=3)
+        for item in (self.item1, self.item2):
+            self.db.assign(item, self.a1)
+            self.db.assign(item, self.a2)
+            self.db.submit_annotation(item, self.a1, "中性")
+            self.db.submit_annotation(item, self.a2, "中性")
+        self.db.assign(item3, self.a1)
+        self.db.assign(item3, self.a2)
+        self.db.submit_annotation(item3, self.a1, "中性")
+        self.db.submit_annotation(item3, self.a2, "中性")
+        with self.assertRaisesRegex(DomainError, "覆盖人数不足.*还差1人"):
+            self.db.freeze_batch(self.batch, self.mgr)
+        self.db.assign(item3, a3)
+        self.db.submit_annotation(item3, a3, "中性")
+        result = self.db.freeze_batch(self.batch, self.mgr)
+        self.assertIsNotNone(result["frozen_at"])
+
 
 if __name__ == "__main__":
     unittest.main()

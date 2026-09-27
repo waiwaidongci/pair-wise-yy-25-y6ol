@@ -74,9 +74,11 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/batches":
                 return self._json(201, {"ok": True, "id": self.db.create_batch(str(body.get("name", "")), int(body.get("guideline_id", 0)))})
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "items":
-                return self._json(201, {"ok": True, "id": self.db.add_item(int(parts[2]), int(body.get("ordinal", 0)), str(body.get("text", "")))})
+                return self._json(201, {"ok": True, "id": self.db.add_item(int(parts[2]), int(body.get("ordinal", 0)), str(body.get("text", "")), int(body.get("required_annotators", 2)))})
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "assign":
-                return self._json(201, {"ok": True, "id": self.db.assign(int(body.get("item_id", 0)), int(body.get("annotator_id", 0)))})
+                return self._json(201, {"ok": True, **self.db.assign(int(body.get("item_id", 0)), int(body.get("annotator_id", 0)))})
+            if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "return":
+                return self._json(200, {"ok": True, **self.db.return_task(int(parts[2]), int(body.get("annotator_id", 0)))})
             if path == "/api/annotations":
                 return self._json(201, {"ok": True, "id": self.db.submit_annotation(int(body.get("item_id", 0)), int(body.get("annotator_id", 0)), str(body.get("label", "")), str(body.get("comment", "")))})
             if path == "/api/adjudications":
